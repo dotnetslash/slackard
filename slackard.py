@@ -43,7 +43,15 @@ class Slackard(object):
         self.apikey = self.config.slackard['apikey']
         self.botname = self.config.slackard['botname']
         self.botnick = self.config.slackard['botnick']
-        self.channel = self.config.slackard['channel']
+        self.channels = self.config.slackard['channel']
+        # multi-channel support
+        #   self.channels is name, ID pairs, populated in _init_connection
+        if ',' in self.channels:
+            self.channels = (x.strip() for x in self.channels.split(","))
+        else:
+            self.channels = (self.channels,)
+        self.channels = dict.fromkeys(self.channels)
+        self.chan_ids = {}
         self.plugins = self.config.slackard['plugins']
         try:
             self.boticon = self.config.slackard['boticon']
@@ -74,6 +82,7 @@ class Slackard(object):
                 print('Failed to import {0}: {1}'.format(module, e))
 
     def _get_plugin_path(self):
+        """Resolve plugin path"""
         path = self.plugins
         cf = self.config.file
         if path[0] != '/':
@@ -81,6 +90,7 @@ class Slackard(object):
         return path
 
     def _set_import_path(self):
+        """add plugin path to path"""
         path = self._get_plugin_path()
         # Use the parent directory of plugin path
         path = os.path.dirname(path)
@@ -88,6 +98,7 @@ class Slackard(object):
             sys.path = [path] + sys.path
 
     def _init_connection(self):
+        """Set up connection and populate channel IDs"""
         self.slack = slacker.Slacker(self.apikey)
         try:
             r = self.slack.channels.list()
@@ -99,51 +110,110 @@ class Slackard(object):
             raise SlackardNonFatalError(e.message)
 
         c_map = {c['name']: c['id'] for c in r.body['channels']}
-        self.chan_id = c_map[self.channel]
+        self.chan_ids = {}
+        for x in self.channels:
+            self.channels[x] = c_map[x]
+            self.chan_ids[self.channels[x]] = x
 
     def _fetch_messages_since(self, oldest=None):
-        h = self.slack.channels.history(self.chan_id, oldest=oldest)
-        assert(h.successful)
-        messages = h.body['messages']
-        messages.reverse()
-        return [m for m in messages if m['ts'] != oldest]
+        """Fetch messages from all configured channels"""
+        all_messages = []
+        for channel in self.channels.values():
+            h = self.slack.channels.history(channel, oldest=oldest)
+            assert(h.successful)
+            messages = h.body['messages']
+            # insert channel and chan_id in message attributes
+            for x in range(len(messages)):
+                messages[x]['chan_id'] = channel
+                messages[x]['channel'] = self.chan_ids[channel]
+            messages.reverse()
+            all_messages.extend(messages)
+        return [m for m in all_messages if m['ts'] != oldest]
 
-    def speak(self, message=None, paste=False, attachments=None):
-        if paste:
-            message = '```{0}```'.format(message)
-        self.slack.chat.post_message(self.chan_id, message,
-                                     username=self.botname,
-                                     icon_emoji=self.botemoji,
-                                     icon_url=self.boticon,
-                                     attachments=attachments)
+    def _resolve_channels(self, channels=None):
+        """Return a tuple if channel IDs from channels argument
 
-    def upload(self, file, filename=None, title=None):
+        argument may be a channel ID or name as a string or a list of any
+        combination if channel IDs or names
+
+        Returns a tuple of unique (de-duplicated) channel IDs
+        """
+        if channels is None:
+            channels = self.channels.keys()
+        elif type(channels) == str:
+            channels = [channels]
+        result = []
+        for channel in channels:
+            if channel in self.chan_ids:
+                result.append(channel)
+            elif channel in self.channels:
+                result.append(self.channels[channel])
+            else:
+                raise AssertionError('"{0}" is an unknown channel'.format(channel))
+        return tuple(set(result))
+
+    def speak(self, message=None, paste=False, attachments=None, channel=None):
+        """Speak into requested channels
+
+            argument may be a channel ID or name as a string or a list of any
+            combination if channel IDs or names. (Default speaks into all
+            configured channels.)
+        """
+        channels = self._resolve_channels(channel)
+        for channel in channels:
+            if paste:
+                message = '```{0}```'.format(message)
+            self.slack.chat.post_message(channel, message,
+                                         username=self.botname,
+                                         icon_emoji=self.botemoji,
+                                         icon_url=self.boticon,
+                                         attachments=attachments)
+
+    def upload(self, file_, filename=None, title=None, channel=None):
+        """Upload a file to channel"""
+        channel = self.resolve_channels(channel)
         if title is None:
-            title = ''
-        title = '{} (Upload by {})'.format(title, self.botname)
-        self.slack.files.upload(file, channels=self.chan_id,
-                                filename=filename,
-                                title=title)
+            title = '(Upload by {})'.format(title, self.botname)
+        else:
+            title = '{} (Upload by {})'.format(title, self.botname)
+        for chan in channel:
+            if chan in self.channels:
+                chan = self.channels[chan]
+            assert chan in self.chan_ids
+        self.slack.files.upload(file_, channels=channel,
+                            filename=filename,
+                            title=title)
 
-    def set_topic(self, topic):
-        self.slack.channels.set_topic(channel=self.chan_id, topic=topic)
+    def set_topic(self, topic, channel=None):
+        """Set a channel's topic"""
+        channel = self._resolve_channels(channel)
+        if len(channel) != 1:
+            raise SlackardNonFatalError("set_topic only accepts 1 channel")
+        self.slack.channels.set_topic(channel=channel[0], topic=topic)
 
-    def channel_info(self):
-        info = self.slack.channels.info(channel=self.chan_id)
+    def channel_info(self, channel=None):
+        """Fetch channel's info"""
+        channel = self._resolve_channels(channel)
+        if len(channel) != 1:
+            raise SlackardNonFatalError("channel_info only accepts 1 channel")
+        info = self.slack.channels.info(channel=channel[0])
         return info.body['channel']
 
     def run(self):
+        """Message handling loop"""
         self._init_connection()
         self._import_plugins()
 
         cmd_matcher = re.compile('^{0}:\s*(\S+)\s*(.*)'.format(
                                  self.botnick), re.IGNORECASE)
-        h = self.slack.channels.history(self.chan_id, count=1)
-        assert(h.successful)
+        h = [self.slack.channels.history(x, count=1) for x in
+             self.channels.values()]
         t0 = time.time()
-        if len(h.body['messages']):
-            ts = h.body['messages'][0]['ts']
-        else:
+        ts = max([x.body['messages'][0]['ts'] for x in h
+                 if x.successful
+                 and 'ts' in x.body['messages'][0]])
+
+        if not ts:
             ts = t0
 
         while True:
@@ -185,6 +255,7 @@ class Slackard(object):
                                 f(args, message)
 
     def subscribe(self, pattern):
+        """Register subscriptions to messages matching pattern"""
         if hasattr(pattern, '__call__'):
             raise TypeError('Must supply pattern string')
 
@@ -203,6 +274,7 @@ class Slackard(object):
         return real_subscribe
 
     def command(self, command):
+        """register subscriptions to messages starting with 'botnick:'"""
         if hasattr(command, '__call__'):
             raise TypeError('Must supply command string')
 
@@ -217,6 +289,7 @@ class Slackard(object):
         return real_command
 
     def firehose(self, wrapped):
+        """Register subscription to all messages"""
         @functools.wraps(wrapped)
         def _f(*args, **kwargs):
             return wrapped(*args, **kwargs)
@@ -229,7 +302,7 @@ def usage():
     yaml_template = """
     slackard:
         apikey: my_api_key_from-api.slack.com
-        channel: random
+        channel: random, ...
         botname: Slackard
         botnick: slack  # short form name for commands.
         # Use either boticon or botemoji
